@@ -156,6 +156,27 @@
     };
     return scheduler;
   };
+
+  // Native measurement probes and conversation streaming do not change the
+  // shell. Keep them out of the expensive native-versus-themed parity pass.
+  const mutationAffectsShell = (mutation, { sidebar, composer, controls = [] } = {}) => {
+    const target = mutation.target;
+    if (target?.closest?.('#codex-dream-skin-chrome')) return false;
+    if (controls.some((node) => node === target || node?.contains?.(target))) return true;
+    if (sidebar && (sidebar === target || sidebar.contains(target))) return true;
+    if (mutation.type === 'attributes') {
+      return Boolean(target?.matches?.('[role="menuitemcheckbox"][data-fast-mode-enabled]'));
+    }
+    if (mutation.type !== 'childList') return false;
+    const structural = 'main, aside, .composer-surface-chrome, textarea, [contenteditable="true"], [role="textbox"], [role="main"], [data-testid="home-icon"], [role="menu"], [role="dialog"], [role="menuitemcheckbox"][data-fast-mode-enabled]';
+    for (const node of [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])]) {
+      if (node.nodeType !== 1 || node.id === 'codex-dream-skin-chrome') continue;
+      if (node.matches(structural) || node.querySelector(structural)) return true;
+      if (target?.matches?.('main') && (node.matches('header') || node.querySelector('header'))) return true;
+      if (composer?.contains?.(target) && (node.matches('button, svg') || node.querySelector('button, svg'))) return true;
+    }
+    return false;
+  };
   const selectCapabilityEnhancements = (entries) => entries
     .filter((entry) => entry?.result?.state === "verified" && entry?.parity?.pass === true)
     .map((entry) => entry.key);
@@ -219,5 +240,5 @@
     return Math.round(normalized * Math.max(0, Number(travelMs) || 0));
   };
 
-  return { adaptiveRelocateCandidate, artVariables, classifyCandidates, compareControl, createDebouncedScheduler, createOwnershipRegistry, fastModeState, hashText, hitTestControl, isAmberStatusColor, isBansheeWaveAnimation, isFastAwakeningActive, isIdleCompletedStatusDot, propagationDelay, selectCapabilityEnhancements, snapshotControl };
+  return { adaptiveRelocateCandidate, artVariables, classifyCandidates, compareControl, createDebouncedScheduler, createOwnershipRegistry, fastModeState, hashText, hitTestControl, isAmberStatusColor, isBansheeWaveAnimation, isFastAwakeningActive, isIdleCompletedStatusDot, mutationAffectsShell, propagationDelay, selectCapabilityEnhancements, snapshotControl };
 })()

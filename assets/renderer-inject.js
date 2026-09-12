@@ -143,6 +143,8 @@
   if (previous?.observer) previous.observer.disconnect();
   if (previous?.resizeObserver) previous.resizeObserver.disconnect();
   if (previous?.fastObserver) previous.fastObserver.disconnect();
+  if (previous?.fastPopupClickListener) document.removeEventListener('click', previous.fastPopupClickListener, true);
+  if (previous?.windowResizeListener) window.removeEventListener('resize', previous.windowResizeListener);
   if (previous?.timer) clearInterval(previous.timer);
   previous?.scheduler?.cancel?.();
   previous?.restoreOwned?.();
@@ -220,6 +222,27 @@
   let activeTheme = readTheme();
   let dreamChromeMarkup = previous?.dreamChromeMarkup ?? null;
   let lastCapabilityReport = "";
+  let reconcileCache = null;
+  let shellDirty = true;
+  const controlSignature = (node) => node ? [
+    node.getAttribute('aria-label'), node.getAttribute('aria-pressed'),
+    node.getAttribute('aria-checked'), node.getAttribute('data-fast-mode-enabled'),
+    node.getAttribute('data-fast-mode'), node.disabled, node.querySelector('svg')?.outerHTML,
+  ].join('|') : '';
+  const surfaceSignature = (node) => [node.getAttribute('role'), node.hidden,
+    [...node.classList].filter((name) => !name.startsWith('dream-')).join(' ')].join('|');
+  const statusSignature = (sidebar) => sidebar ? [...sidebar.querySelectorAll(
+    '[data-app-action-sidebar-thread-row] .rounded-full'
+  )].map((node) => `${node.className}|${node.getAttribute('style')}`).join(';') : '';
+  // No geometry/style reads here: the unchanged watchdog must never flush style.
+  const cacheIsCurrent = () => reconcileCache && reconcileCache.route === location.href &&
+    reconcileCache.theme === activeTheme && reconcileCache.layout === activeLayout &&
+    reconcileCache.nodes.every((node, index) => node.isConnected &&
+      node.parentNode === reconcileCache.parents[index] && surfaceSignature(node) === reconcileCache.surfaces[index]) &&
+    document.getElementById(STYLE_ID) === reconcileCache.style &&
+    document.getElementById(CHROME_ID) === reconcileCache.chrome &&
+    document.documentElement.getAttribute('data-dream-pack-ready') === 'banshee-v1' &&
+    reconcileCache.controls.every((node, index) => controlSignature(node) === reconcileCache.signatures[index]);
 
   const syncThemeMeta = () => {
     const meta = THEME_META[activeTheme];
@@ -293,8 +316,14 @@
     syncThemeMeta();
   };
 
-  const ensure = () => {
+  const ensure = (force = true) => {
     if (window.__CODEX_DREAM_SKIN_DISABLED__) return;
+    if (!force && !shellDirty && cacheIsCurrent()) {
+      metrics.cachedPasses += 1;
+      return;
+    }
+    shellDirty = false;
+    reconcileCache = null;
     metrics.ensureRuns += 1;
     metrics.globalScans += 1;
     const root = document.documentElement;
@@ -758,6 +787,17 @@
         if (animation.startTime !== waveEpoch) animation.startTime = waveEpoch;
       }
     }
+    if (bansheeActive) {
+      const controls = [microphoneResult.node, fastModeResult.node].filter(Boolean);
+      const nodes = [sidePanel, shellMain, composer, composerHost, composerContext, threadHeaderResult.node, ...controls].filter(Boolean);
+      reconcileCache = {
+        route: location.href, theme: activeTheme, layout: activeLayout,
+        sidebar: sidePanel, composer, controls,
+        nodes, parents: nodes.map((node) => node.parentNode), surfaces: nodes.map(surfaceSignature),
+        status: statusSignature(sidePanel),
+        signatures: controls.map(controlSignature), style, chrome,
+      };
+    }
   };
 
   const cleanup = () => {
@@ -791,6 +831,7 @@
     if (state?.fastPopupClickListener) {
       document.removeEventListener("click", state.fastPopupClickListener, true);
     }
+    if (state?.windowResizeListener) window.removeEventListener('resize', state.windowResizeListener);
     if (state?.timer) clearInterval(state.timer);
     state?.scheduler?.cancel?.();
     for (const assets of Object.values(state?.artUrls || {})) {
@@ -801,9 +842,12 @@
     return true;
   };
 
-  const metrics = { ensureRuns: 0, globalScans: 0, mutationBatches: 0, addedNodes: 0 };
-  const scheduler = bansheeRuntime.createDebouncedScheduler(setTimeout, clearTimeout, ensure, 180);
-  const scheduleEnsure = scheduler.schedule;
+  const metrics = { ensureRuns: 0, globalScans: 0, mutationBatches: 0, addedNodes: 0, cachedPasses: 0, ignoredMutationBatches: 0 };
+  const scheduler = bansheeRuntime.createDebouncedScheduler(setTimeout, clearTimeout, () => ensure(false), 180);
+  const scheduleEnsure = () => {
+    shellDirty = true;
+    scheduler.schedule();
+  };
   const fastPopupClickListener = (event) => {
     const rootElement = document.documentElement;
     const toggle = event.target?.closest?.('[role="menuitemcheckbox"][data-fast-mode-enabled]');
@@ -824,11 +868,17 @@
   let observedComposer = null;
   const resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(scheduleEnsure) : null;
   let observedFastNode = null;
+  const windowResizeListener = scheduleEnsure;
+  window.addEventListener('resize', windowResizeListener);
   const fastObserver = typeof MutationObserver === 'function' ? new MutationObserver(scheduleEnsure) : null;
   const observer = new MutationObserver((mutations) => {
     metrics.mutationBatches += 1;
     for (const mutation of mutations) metrics.addedNodes += mutation.addedNodes?.length ?? 0;
-    scheduleEnsure();
+    if (!cacheIsCurrent() || mutations.some((mutation) => bansheeRuntime.mutationAffectsShell(mutation, reconcileCache))) {
+      scheduleEnsure();
+    } else {
+      metrics.ignoredMutationBatches += 1;
+    }
   });
   observer.observe(document.documentElement, {
     childList: true,
@@ -836,7 +886,10 @@
     attributes: true,
     attributeFilter: ["aria-pressed", "aria-checked", "data-fast-mode-enabled", "data-fast-mode"],
   });
-  const timer = setInterval(ensure, 5000);
+  const timer = setInterval(() => {
+    if (reconcileCache && statusSignature(reconcileCache.sidebar) !== reconcileCache.status) shellDirty = true;
+    ensure(false);
+  }, 5000);
   window[STATE_KEY] = {
     ensure,
     cleanup,
@@ -844,6 +897,7 @@
     timer,
     scheduler,
     fastPopupClickListener,
+    windowResizeListener,
     metrics,
     resizeObserver,
     fastObserver,
@@ -859,8 +913,8 @@
     setLayout: applyLayout,
     get theme() { return activeTheme; },
     setTheme: applyTheme,
-    version: "2.3.0"
+    version: "2.3.1"
   };
   ensure();
-  return { installed: true, version: "2.3.0", layout: activeLayout, theme: activeTheme, themes: [...THEME_ORDER] };
+  return { installed: true, version: "2.3.1", layout: activeLayout, theme: activeTheme, themes: [...THEME_ORDER] };
 })(__DREAM_CSS_JSON__, __DREAM_ART_ASSETS_JSON__, __DREAM_MANIFEST_JSON__, __BANSHEE_RUNTIME_FACTORY__)
